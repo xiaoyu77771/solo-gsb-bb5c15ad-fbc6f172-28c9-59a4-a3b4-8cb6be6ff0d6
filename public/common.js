@@ -45,6 +45,7 @@ const CueClient = (() => {
         try { data = JSON.parse(ev.data); } catch { return; }
         if (data.type === 'state') opts.onState(data.state);
         else if (data.type === 'error' && opts.onError) opts.onError(data.message);
+        else if (opts.onMessage) opts.onMessage(data); // 租约授予/续期等定向消息
       };
       ws.onclose = () => {
         if (opts.onConnChange) opts.onConnChange(false);
@@ -88,6 +89,12 @@ const CueClient = (() => {
     'confirm-late': '迟到确认',
     'confirm-duplicate': '重复确认',
     'position-substituted': '临时替岗',
+    'lease-acquired': '指挥权租约授予',
+    'lease-acquire-denied': '租约申请被拒',
+    'lease-released': '指挥权释放',
+    'lease-expired': '租约超期自动释放',
+    'lease-op-denied': '越权操作被拒',
+    'stale-lease-heartbeat-ignored': '旧租约心跳被拒',
     'sequence-finished': '全部口令完成',
     'session-reset': '场次重置',
     'position-online': '岗位上线',
@@ -102,7 +109,9 @@ const CueClient = (() => {
         .join(' ');
       const cls = ['cue-timeout', 'confirm-duplicate', 'confirm-late',
         'stale-confirm-ignored', 'stale-timeout-ignored', 'stale-substitute-ignored',
-        'cue-recalled', 'cue-paused', 'paused-confirm-rejected'].includes(e.event)
+        'cue-recalled', 'cue-paused', 'paused-confirm-rejected',
+        'lease-expired', 'lease-acquire-denied', 'lease-op-denied',
+        'stale-lease-heartbeat-ignored'].includes(e.event)
         ? 'log-warn' : '';
       return `<div class="log-row ${cls}"><span class="log-ts">${fmtTime(e.ts)}</span>` +
         `<span class="log-event">${label}</span><span class="log-detail">${escapeHtml(detail)}</span></div>`;

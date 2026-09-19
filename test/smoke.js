@@ -10,15 +10,17 @@ function check(name, cond) {
   else { failed++; console.log(`  ✘ ${name}`); }
 }
 
-function client(role, position) {
+function client(role, position, cid) {
   const ws = new WebSocket(URL);
   const c = {
     ws,
     state: null,
     errors: [],
+    leaseToken: null,   // lease-granted 定向下发的租约凭证
+    leaseGranted: null,
     ready: new Promise((res) => {
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'hello', role, position, clientId: 'test-' + role + '-' + (position || '') }));
+        ws.send(JSON.stringify({ type: 'hello', role, position, clientId: cid || ('test-' + role + '-' + (position || '')) }));
         res();
       });
     }),
@@ -37,6 +39,7 @@ function client(role, position) {
     const d = JSON.parse(m);
     if (d.type === 'state') c.state = d.state;
     if (d.type === 'error') c.errors.push(d.message);
+    if (d.type === 'lease-granted') { c.leaseToken = d.token; c.leaseGranted = d; }
   });
   return c;
 }
@@ -44,6 +47,18 @@ function client(role, position) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 岗位确认必须携带其最新快照中的 attemptId（与岗位端页面行为一致）
 const confirmCue = (c) => c.send({ type: 'confirm', attemptId: c.state.attemptId });
+
+// 控制端心跳续期（与控制端页面行为一致：持有期间按固定间隔发送租约心跳）
+const hbTimers = new Map();
+function startHeartbeat(c, intervalMs = 2000) {
+  stopHeartbeat(c);
+  hbTimers.set(c, setInterval(() => {
+    if (c.leaseToken) c.send({ type: 'lease-heartbeat', token: c.leaseToken });
+  }, intervalMs));
+}
+function stopHeartbeat(c) {
+  if (hbTimers.has(c)) { clearInterval(hbTimers.get(c)); hbTimers.delete(c); }
+}
 
 (async () => {
   const director = client('director');
@@ -54,7 +69,16 @@ const confirmCue = (c) => c.send({ type: 'confirm', attemptId: c.state.attemptId
   await Promise.all([director.ready, control.ready, light.ready, sound.ready, prop.ready]);
   await sleep(200);
 
-  console.log('0. 重置场次，确保干净起点');
+  console.log('0. 主控制端申请指挥权租约（后续开始/推进/重置等均需持有租约）');
+  control.send({ type: 'lease-acquire', name: '主控' });
+  const st0 = await control.waitState((s) => s.lease && s.lease.holderId === 'test-control-');
+  check('租约申请成功并定向下发凭证', !!control.leaseGranted && typeof control.leaseToken === 'string');
+  check('快照展示持有者与剩余有效期',
+    st0.lease.holderId === 'test-control-' && st0.lease.holderName === '主控' &&
+    st0.lease.remainingMs > 0 && st0.lease.ttlMs > 0 && !st0.lease.token);
+  startHeartbeat(control);
+
+  console.log('0.1 重置场次，确保干净起点');
   control.send({ type: 'reset' });
   await control.waitState((s) => s.phase === 'idle');
 
@@ -393,6 +417,101 @@ const confirmCue = (c) => c.send({ type: 'confirm', attemptId: c.state.attemptId
   control.send({ type: 'reset' });
   st = await control.waitState((s) => s.phase === 'idle');
   check('重置后暂停状态清空', st.paused === false && st.pauseReason === null && st.remainingMs === null);
+
+  console.log('34. 非持有者的七类指挥操作全部被服务端拒绝');
+  const controlB = client('control', null, 'test-control-b');
+  const controlC = client('control', null, 'test-control-c');
+  await Promise.all([controlB.ready, controlC.ready]);
+  await sleep(200);
+  controlB.send({ type: 'start' });
+  controlB.send({ type: 'advance' });
+  controlB.send({ type: 'reset' });
+  controlB.send({ type: 'substitute', from: '灯光', to: '音响' });
+  controlB.send({ type: 'recall', reason: 'x', text: 'y' });
+  controlB.send({ type: 'pause', reason: 'x' });
+  controlB.send({ type: 'resume' });
+  await sleep(400);
+  check('七种越权操作均收到拒绝', controlB.errors.filter((e) => e.includes('指挥权')).length === 7);
+  const denied = control.state.log.filter(
+    (l) => l.event === 'lease-op-denied' && l.detail.clientId === 'test-control-b');
+  check('越权操作全部写入日志（按操作类型）', denied.length >= 7 &&
+    ['start', 'advance', 'reset', 'substitute', 'recall', 'pause', 'resume']
+      .every((op) => denied.some((d) => d.detail.op === op)));
+  check('越权操作未改变场次状态', control.state.phase === 'idle');
+  check('租约仍归主控制端', control.state.lease.holderId === 'test-control-');
+
+  console.log('35. 心跳续期：剩余有效期随心跳延长');
+  const expBefore = control.state.lease.expiresAt;
+  await sleep(2500); // 心跳每 2 秒一次，期间至少续期一次
+  check('心跳续期延长有效期', control.state.lease.expiresAt > expBefore);
+  check('续期期间租约未被释放', control.state.lease.holderId === 'test-control-');
+
+  console.log('36. 租约未到期时他人申请被拒；持有者主动释放');
+  controlB.send({ type: 'lease-acquire', name: 'B' });
+  await sleep(300);
+  check('未到期申请被拒且未获凭证', !controlB.leaseGranted &&
+    controlB.errors.some((e) => e.includes('持有')));
+  check('申请拒绝写入日志', control.state.log.some(
+    (l) => l.event === 'lease-acquire-denied' && l.detail.requester === 'test-control-b'));
+  check('租约仍归原持有者', control.state.lease.holderId === 'test-control-');
+  stopHeartbeat(control);
+  const staleToken = control.leaseToken; // 旧凭证留作“迟到心跳”测试
+  control.send({ type: 'lease-release', token: staleToken });
+  st = await control.waitState((s) => !s.lease.holderId);
+  check('主动释放生效', st.lease.holderId === null);
+  check('释放写入日志', st.log.some((l) => l.event === 'lease-released' && l.detail.reason === 'voluntary'));
+  controlB.send({ type: 'start' });
+  await sleep(200);
+  check('无人持有时指挥操作同样被拒', controlB.errors.some((e) => e.includes('无人持有')));
+
+  console.log('37. 竞争申请原子裁决：同时申请恰好一人成功');
+  controlB.leaseGranted = null;
+  controlC.leaseGranted = null;
+  controlB.send({ type: 'lease-acquire', name: 'B' });
+  controlC.send({ type: 'lease-acquire', name: 'C' });
+  await sleep(400);
+  const bWon = !!controlB.leaseGranted;
+  const cWon = !!controlC.leaseGranted;
+  check('竞争申请恰好一人获胜', bWon !== cWon);
+  const winnerId = bWon ? 'test-control-b' : 'test-control-c';
+  const loser = bWon ? controlC : controlB;
+  check('快照持有者为胜者', control.state.lease.holderId === winnerId);
+  check('败者收到持有拒绝', loser.errors.some((e) => e.includes('持有')));
+
+  console.log('38. 旧连接的迟到心跳不得续活新租约');
+  const winnerExp = control.state.lease.expiresAt;
+  control.send({ type: 'lease-heartbeat', token: staleToken }); // 旧持有者的迟到心跳
+  await sleep(300);
+  check('旧凭证心跳被拒绝', control.errors.some((e) => e.includes('心跳') || e.includes('租约')));
+  check('旧心跳拒绝写入日志', control.state.log.some((l) => l.event === 'stale-lease-heartbeat-ignored'));
+  check('新租约仍归胜者所有', control.state.lease.holderId === winnerId);
+  check('旧心跳未延长新租约有效期', control.state.lease.expiresAt === winnerExp);
+
+  console.log('39. 心跳停止 → 租约超期自动释放 → 他人接管');
+  // 胜者（B 或 C）从未发送心跳，等待租约到期被清扫器自动释放
+  st = await control.waitState((s) => !s.lease.holderId, 25000);
+  check('心跳停止后租约超期自动释放', st.lease.holderId === null);
+  check('超期释放写入日志', st.log.some((l) => l.event === 'lease-expired' && l.detail.holderId === winnerId));
+  control.leaseGranted = null;
+  control.send({ type: 'lease-acquire', name: '主控' });
+  st = await control.waitState((s) => s.lease.holderId === 'test-control-');
+  check('过期后他人可接管租约', st.lease.holderId === 'test-control-' && !!control.leaseGranted);
+  control.send({ type: 'lease-heartbeat', token: staleToken }); // 同一控制端的旧连接凭证同样失效
+  await sleep(300);
+  check('接管后旧凭证心跳仍被拒',
+    control.state.log.filter((l) => l.event === 'stale-lease-heartbeat-ignored').length >= 2);
+  check('新租约未被旧心跳影响', control.state.lease.holderId === 'test-control-');
+  control.send({ type: 'start' }); // 接管者实际执行指挥操作
+  st = await control.waitState((s) => s.phase === 'active');
+  check('接管后指挥操作恢复可用', st.phase === 'active');
+  control.send({ type: 'reset' });
+  await control.waitState((s) => s.phase === 'idle');
+
+  console.log('40. 持有者断线 → 租约立即自动释放');
+  control.ws.close(); // control 当前持有租约（第 39 步接管）
+  st = await controlB.waitState((s) => !s.lease.holderId);
+  check('断线后租约自动释放', st.lease.holderId === null);
+  check('断线释放写入日志', st.log.some((l) => l.event === 'lease-released' && l.detail.reason === 'disconnect'));
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   process.exit(failed ? 1 : 0);

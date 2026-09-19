@@ -5,6 +5,8 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
+      # 指挥权租约有效期（秒），默认 15：持有者按心跳续期，断线/超时自动释放
+      - LEASE_TTL_SEC=15
     volumes:
       # 挂载事件日志目录，容器重启后本场日志仍可查阅
       - ./data:/app/data

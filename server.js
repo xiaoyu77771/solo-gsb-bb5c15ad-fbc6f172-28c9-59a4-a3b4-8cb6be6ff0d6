@@ -11,6 +11,9 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const DEFAULT_TIMEOUT_SEC = 30;
 const MAX_LOG_ENTRIES = 500;
+// 指挥权租约：有效期默认 15 秒（LEASE_TTL_SEC 可调，5–300），持有者按心跳续期
+const LEASE_TTL_MS = Math.min(300000, Math.max(5000, Number(process.env.LEASE_TTL_SEC || 15) * 1000));
+const LEASE_SWEEP_MS = Math.min(10000, Math.max(200, Number(process.env.LEASE_SWEEP_MS || 1000))); // 过期租约清扫周期：心跳停止后至多延迟 1 秒自动释放
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -38,6 +41,10 @@ const state = {
   pausedBy: null, // 操作者 clientId
   remainingMs: null, // 冻结的剩余确认时长（ms），恢复时以此重排 deadline，重复暂停/恢复不累计误差
   timerToken: 0, // 定时器凭证：每次撤销/重排计时器时递增，旧回调凭 token 不匹配被拒绝
+  // 指挥权租约：多个控制端可同时在线，但同一时刻仅持有者可执行
+  // 开始 / 推进 / 替岗 / 撤回 / 暂停 / 恢复 / 重置。token 为本次授予的唯一凭证，
+  // 心跳与释放必须携带；旧连接的迟到心跳凭 token 不符被拒绝，绝不续活新租约
+  lease: { holderId: null, holderName: null, token: null, acquiredAt: null, expiresAt: null },
   log: [], // [{ ts, event, detail }]
 };
 
@@ -125,6 +132,15 @@ function publicState() {
     pausedAt: state.pausedAt,
     pausedBy: state.pausedBy,
     remainingMs: state.remainingMs,
+    // 指挥权租约：持有者与剩余有效期随全量快照下发，各端据此禁用/启用操作（token 不下发）
+    lease: {
+      ttlMs: LEASE_TTL_MS,
+      holderId: state.lease.holderId,
+      holderName: state.lease.holderName,
+      acquiredAt: state.lease.acquiredAt,
+      expiresAt: state.lease.expiresAt,
+      remainingMs: state.lease.holderId ? Math.max(0, state.lease.expiresAt - Date.now()) : 0,
+    },
     serverNow: Date.now(),
     onlinePositions: [...onlinePositions],
     log: state.log.slice(-200),
@@ -160,6 +176,51 @@ function send(ws, payload) {
 
 function sendError(ws, message) {
   send(ws, { type: 'error', message });
+}
+
+// ---------------------------------------------------------------------------
+// 指挥权租约
+// ---------------------------------------------------------------------------
+// 多个控制端可同时在线，但同一时刻只有租约持有者可执行指挥操作。
+// 租约由持有者按心跳续期；断线立即释放（见 close 处理），心跳停止由清扫器超时释放。
+// 每次授予生成新 token：旧连接的迟到心跳/释放凭旧 token 一律拒绝，绝不续活新租约。
+// Node 单线程消息处理保证竞争申请的检查与授予在同一同步块内完成，原子裁决、先到者得。
+function resetLease() {
+  state.lease = { holderId: null, holderName: null, token: null, acquiredAt: null, expiresAt: null };
+}
+
+// 过期即释放（清扫器周期调用 + 申请/越权校验时惰性调用），释放后广播全量快照
+function sweepLeaseIfExpired() {
+  const lease = state.lease;
+  if (!lease.holderId || lease.expiresAt > Date.now()) return false;
+  addLog('lease-expired', { holderId: lease.holderId, holderName: lease.holderName });
+  resetLease();
+  broadcastState();
+  return true;
+}
+
+// 七类指挥操作（开始/推进/替岗/撤回/暂停/恢复/重置）的统一越权校验：
+// 仅持有有效租约的控制端可执行；拒绝一律写入日志并随快照同步
+function requireLease(ws, op) {
+  const meta = ws.meta || {};
+  sweepLeaseIfExpired();
+  const lease = state.lease;
+  let reason = null;
+  if (meta.role !== 'control') {
+    reason = '仅控制端可以执行此操作';
+  } else if (!lease.holderId) {
+    reason = '当前无人持有指挥权租约，请先在控制端申请指挥权';
+  } else if (lease.holderId !== meta.clientId) {
+    const remainSec = Math.ceil((lease.expiresAt - Date.now()) / 1000);
+    reason = `指挥权租约由「${lease.holderName || lease.holderId}」持有（剩余约 ${remainSec} 秒），您无权操作；待其释放或过期后可接管`;
+  }
+  if (reason) {
+    addLog('lease-op-denied', { op, clientId: meta.clientId || null, reason });
+    broadcastState();
+    sendError(ws, reason);
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +438,102 @@ function handleMessage(ws, msg) {
       } else {
         send(ws, { type: 'state', state: publicState() });
       }
+      // 持有指挥权的控制端重连（或同 clientId 的另一连接登记）：重新下发租约凭证以恢复心跳续期
+      if (ws.meta.role === 'control' && state.lease.holderId === ws.meta.clientId &&
+          state.lease.expiresAt > Date.now()) {
+        send(ws, {
+          type: 'lease-granted',
+          token: state.lease.token,
+          expiresAt: state.lease.expiresAt,
+          ttlMs: LEASE_TTL_MS,
+        });
+      }
+      break;
+    }
+
+    case 'lease-acquire': {
+      // 申请 / 接管指挥权租约：无人持有或租约已过期时授予；被他人持有且未过期时拒绝。
+      // 竞争申请原子裁决：检查与授予在同一同步消息处理内完成，两个并发申请先到者得。
+      const meta = ws.meta || {};
+      if (meta.role !== 'control') return sendError(ws, '仅控制端可以申请指挥权租约');
+      const now = Date.now();
+      const lease = state.lease;
+      const name = String(data.name || '').trim().slice(0, 24) || null;
+      // 持有者本人重复申请：幂等续期，token 不变（客户端重试安全）
+      if (lease.holderId === meta.clientId && lease.expiresAt > now) {
+        lease.expiresAt = now + LEASE_TTL_MS;
+        if (name) lease.holderName = name;
+        send(ws, { type: 'lease-granted', token: lease.token, expiresAt: lease.expiresAt, ttlMs: LEASE_TTL_MS });
+        broadcastState();
+        break;
+      }
+      if (lease.holderId && lease.expiresAt > now) {
+        const remainSec = Math.ceil((lease.expiresAt - now) / 1000);
+        addLog('lease-acquire-denied', {
+          requester: meta.clientId,
+          holderId: lease.holderId,
+          holderName: lease.holderName,
+          remainingSec: remainSec,
+        });
+        broadcastState();
+        return sendError(ws, `指挥权租约由「${lease.holderName || lease.holderId}」持有（剩余约 ${remainSec} 秒），到期或释放后可接管`);
+      }
+      // 授予新租约（含接管已过期租约）：生成新 token，旧连接的心跳凭证随之失效
+      const previous = lease.holderId && lease.holderId !== meta.clientId
+        ? { holderId: lease.holderId, holderName: lease.holderName }
+        : null;
+      state.lease = {
+        holderId: meta.clientId,
+        holderName: name,
+        token: crypto.randomUUID(),
+        acquiredAt: now,
+        expiresAt: now + LEASE_TTL_MS,
+      };
+      addLog('lease-acquired', {
+        holderId: state.lease.holderId,
+        holderName: name,
+        ttlSec: LEASE_TTL_MS / 1000,
+        takeover: !!previous, // 接管他人已过期租约
+        previousHolder: previous ? (previous.holderName || previous.holderId) : null,
+      });
+      send(ws, { type: 'lease-granted', token: state.lease.token, expiresAt: state.lease.expiresAt, ttlMs: LEASE_TTL_MS });
+      broadcastState();
+      break;
+    }
+
+    case 'lease-release': {
+      // 主动释放：仅持有者本人且携带当前 token 才可释放
+      const meta = ws.meta || {};
+      if (meta.role !== 'control') return sendError(ws, '仅控制端可以释放指挥权租约');
+      const lease = state.lease;
+      if (!lease.holderId || lease.holderId !== meta.clientId || data.token !== lease.token) {
+        return sendError(ws, '您当前未持有指挥权租约，无法释放');
+      }
+      addLog('lease-released', { holderId: lease.holderId, holderName: lease.holderName, reason: 'voluntary' });
+      resetLease();
+      broadcastState();
+      break;
+    }
+
+    case 'lease-heartbeat': {
+      // 心跳续期：仅持有者本人且 token 与当前租约一致才续期。
+      // 旧连接的迟到心跳（token 不符 / 租约已易主或释放 / 已过期）只拒绝并记录，绝不续活新租约
+      const meta = ws.meta || {};
+      const lease = state.lease;
+      const now = Date.now();
+      if (!lease.holderId || lease.holderId !== meta.clientId || data.token !== lease.token) {
+        addLog('stale-lease-heartbeat-ignored', { clientId: meta.clientId || null, reason: 'token-mismatch' });
+        broadcastState();
+        return sendError(ws, '心跳凭证已失效：指挥权租约已易主或已释放，如需操作请重新申请');
+      }
+      if (lease.expiresAt <= now) {
+        addLog('stale-lease-heartbeat-ignored', { clientId: meta.clientId, reason: 'expired' });
+        broadcastState();
+        return sendError(ws, '指挥权租约已过期，心跳无法续期，请重新申请');
+      }
+      lease.expiresAt = now + LEASE_TTL_MS;
+      send(ws, { type: 'lease-renewed', expiresAt: lease.expiresAt, ttlMs: LEASE_TTL_MS });
+      broadcastState();
       break;
     }
 
@@ -420,6 +577,7 @@ function handleMessage(ws, msg) {
     }
 
     case 'start': {
+      if (!requireLease(ws, 'start')) break;
       if (state.phase === 'active') return sendError(ws, '口令正在进行中');
       if (state.sequence.length === 0) return sendError(ws, '请先由导演端创建演出序列');
       if (state.phase === 'done') return sendError(ws, '本场已结束，请重置后重新开始');
@@ -429,6 +587,7 @@ function handleMessage(ws, msg) {
     }
 
     case 'advance': {
+      if (!requireLease(ws, 'advance')) break;
       if (state.phase !== 'active') return sendError(ws, '当前没有进行中的口令');
       if (state.paused) return sendError(ws, '口令已暂停，请先恢复再推进');
       if (!allConfirmed()) {
@@ -452,6 +611,7 @@ function handleMessage(ws, msg) {
     }
 
     case 'reset': {
+      if (!requireLease(ws, 'reset')) break;
       clearCueTimer();
       state.phase = 'idle';
       state.currentIndex = -1;
@@ -529,11 +689,8 @@ function handleMessage(ws, msg) {
     }
 
     case 'substitute': {
-      // 临时替岗：控制端指定一名在线替补，接管当前口令某个未确认目标
-      const meta = ws.meta || {};
-      if (meta.role !== 'control') {
-        return sendError(ws, '仅控制端可以指定临时替岗');
-      }
+      // 临时替岗：仅持有指挥权租约的控制端可指定一名在线替补，接管当前口令某个未确认目标
+      if (!requireLease(ws, 'substitute')) break;
       const cue = currentCue();
       if (!cue) return sendError(ws, '当前没有进行中的口令');
       // 暂停期间冻结一切岗位操作：替岗被拒绝
@@ -581,11 +738,8 @@ function handleMessage(ws, msg) {
     }
 
     case 'recall': {
-      // 撤回并纠正重发：仅控制端可发起，须填写撤回原因与修正版口令文本
-      const meta = ws.meta || {};
-      if (meta.role !== 'control') {
-        return sendError(ws, '仅控制端可以撤回并纠正重发口令');
-      }
+      // 撤回并纠正重发：仅持有指挥权租约的控制端可发起，须填写撤回原因与修正版口令文本
+      if (!requireLease(ws, 'recall')) break;
       if (state.phase !== 'active' || !currentCue()) {
         return sendError(ws, '仅可撤回当前进行中的口令；已推进或已完成的口令不可撤回');
       }
@@ -604,11 +758,8 @@ function handleMessage(ws, msg) {
     }
 
     case 'pause': {
-      // 暂停当前口令：仅控制端可发起，仅限进行中且尚未全员确认的口令，必须填写原因
-      const meta = ws.meta || {};
-      if (meta.role !== 'control') {
-        return sendError(ws, '仅控制端可以暂停口令');
-      }
+      // 暂停当前口令：仅持有指挥权租约的控制端可发起，仅限进行中且尚未全员确认的口令，必须填写原因
+      if (!requireLease(ws, 'pause')) break;
       if (state.phase !== 'active' || !currentCue()) {
         return sendError(ws, '当前没有进行中的口令，无法暂停');
       }
@@ -625,11 +776,8 @@ function handleMessage(ws, msg) {
     }
 
     case 'resume': {
-      // 恢复当前口令：仅控制端可发起，沿用同一 attemptId 按冻结余量重新计时
-      const meta = ws.meta || {};
-      if (meta.role !== 'control') {
-        return sendError(ws, '仅控制端可以恢复口令');
-      }
+      // 恢复当前口令：仅持有指挥权租约的控制端可发起，沿用同一 attemptId 按冻结余量重新计时
+      if (!requireLease(ws, 'resume')) break;
       if (state.phase !== 'active' || !currentCue()) {
         return sendError(ws, '当前没有进行中的口令，无法恢复');
       }
@@ -660,14 +808,34 @@ wss.on('connection', (ws) => {
         broadcastState();
       }
     }
+    // 租约持有者断线：其最后一个控制端连接关闭时立即释放租约（心跳超时释放由清扫器兜底）
+    if (meta && meta.role === 'control' && meta.clientId && state.lease.holderId === meta.clientId) {
+      const stillConnected = [...wss.clients].some(
+        (c) => c !== ws && c.readyState === c.OPEN && c.meta && c.meta.role === 'control' &&
+          c.meta.clientId === meta.clientId
+      );
+      if (!stillConnected) {
+        addLog('lease-released', {
+          holderId: state.lease.holderId,
+          holderName: state.lease.holderName,
+          reason: 'disconnect',
+        });
+        resetLease();
+        broadcastState();
+      }
+    }
   });
   ws.on('error', () => {});
 });
+
+// 过期租约清扫：心跳停止后租约到期自动释放并广播（断线立即释放见 close 处理）
+setInterval(sweepLeaseIfExpired, LEASE_SWEEP_MS);
 
 server.listen(PORT, () => {
   console.log(`舞台口令同步系统已启动: http://localhost:${PORT}`);
   console.log(`  导演端:   http://localhost:${PORT}/director.html`);
   console.log(`  控制端:   http://localhost:${PORT}/control.html`);
   console.log(`  岗位端:   http://localhost:${PORT}/position.html`);
+  console.log(`  指挥权租约: ${LEASE_TTL_MS / 1000} 秒（心跳续期，超时/断线自动释放）`);
   console.log(`  事件日志: data/events-${state.sessionId}.jsonl`);
 });

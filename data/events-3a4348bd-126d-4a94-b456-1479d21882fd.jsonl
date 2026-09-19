@@ -1,0 +1,6 @@
+{"ts":"2026-09-19T04:43:53.831Z","event":"lease-acquired","detail":{"holderId":"v3-a","holderName":"A","ttlSec":5,"takeover":false,"previousHolder":null}}
+{"ts":"2026-09-19T04:43:59.637Z","event":"lease-acquired","detail":{"holderId":"v3-b","holderName":"B","ttlSec":5,"takeover":true,"previousHolder":"A"}}
+{"ts":"2026-09-19T04:44:00.046Z","event":"lease-released","detail":{"holderId":"v3-b","holderName":"B","reason":"disconnect"}}
+{"ts":"2026-09-19T04:44:27.867Z","event":"lease-acquired","detail":{"holderId":"v4-a","holderName":"A","ttlSec":5,"takeover":false,"previousHolder":null}}
+{"ts":"2026-09-19T04:44:33.973Z","event":"stale-lease-heartbeat-ignored","detail":{"clientId":"v4-a","reason":"expired"}}
+{"ts":"2026-09-19T04:44:34.277Z","event":"lease-released","detail":{"holderId":"v4-a","holderName":"A2","reason":"disconnect"}}
