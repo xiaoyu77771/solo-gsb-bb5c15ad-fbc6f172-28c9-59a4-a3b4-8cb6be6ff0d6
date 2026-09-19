@@ -179,6 +179,10 @@ tr.current-row td { background: #24304a; }
   margin-bottom: 10px;
 }
 
+/* 指挥权租约 */
+.lease-mine { color: #8fe3a5; font-weight: 600; }
+#leaseLeft { color: #f0c169; font-size: 13px; }
+
 /* 只读历史轮次 */
 .attempt-row {
   background: #14161c;

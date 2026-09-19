@@ -21,6 +21,11 @@
     <div class="status-banner" id="banner"></div>
 
     <div class="card">
+      <h2>指挥权租约</h2>
+      <div id="leasePanel"></div>
+    </div>
+
+    <div class="card">
       <h2>当前口令</h2>
       <div id="cueArea"><p class="muted" style="text-align:center;padding:24px">等待开始</p></div>
       <div class="countdown" id="countdown"></div>
@@ -54,7 +59,8 @@
         <button id="btnAdvance" class="narrow">⏭ 推进下一条</button>
         <button id="btnReset" class="danger narrow">↺ 重置场次</button>
       </div>
-      <p class="muted">仅当全部目标岗位确认后才可推进；超时与重复确认会实时标记在下方日志。目标未确认时可点「替岗」，指定一名在线岗位临时接管（仅对本条口令生效）。口令有误且尚未全员确认时，可在上方「撤回并纠正重发」中填写撤回原因与修正版口令，旧轮次将封存为只读历史并重新开始完整确认时限。需要中断时，可在「暂停 / 恢复当前口令」中填写原因后暂停：剩余确认时长冻结、各操作被拒绝，恢复后按冻结余量继续计时。</p>
+      <p class="muted" id="opLeaseHint" style="display:none;color:#f0c169">未持有指挥权租约：开始 / 推进 / 替岗 / 撤回 / 暂停 / 恢复 / 重置均已禁用，请先在上方「指挥权租约」中申请。</p>
+      <p class="muted">仅当全部目标岗位确认后才可推进；超时与重复确认会实时标记在下方日志。目标未确认时可点「替岗」，指定一名在线岗位临时接管（仅对本条口令生效）。口令有误且尚未全员确认时，可在上方「撤回并纠正重发」中填写撤回原因与修正版口令，旧轮次将封存为只读历史并重新开始完整确认时限。需要中断时，可在「暂停 / 恢复当前口令」中填写原因后暂停：剩余确认时长冻结、各操作被拒绝，恢复后按冻结余量继续计时。上述操作均需先持有指挥权租约。</p>
     </div>
 
     <div class="card">
@@ -84,6 +90,8 @@
     const pausePanel = document.getElementById('pausePanel');
     const recallPanel = document.getElementById('recallPanel');
     const attemptsEl = document.getElementById('attempts');
+    const leasePanel = document.getElementById('leasePanel');
+    const opLeaseHint = document.getElementById('opLeaseHint');
     const toast = document.getElementById('toast');
     const btnStart = document.getElementById('btnStart');
     const btnAdvance = document.getElementById('btnAdvance');
@@ -93,6 +101,75 @@
     let lastState = null;
     let countdownTimer = null;
     let substitutingFor = null; // 正在为其选择替补的原岗位
+
+    // ------------------------------------------------------------------
+    // 指挥权租约（客户端侧）：token 由服务端 lease-granted 单独下发，
+    // 心跳按约 1/3 租约时长自动续期；租约不在我名下时立即停止心跳，
+    // 旧凭证的迟到心跳只会被服务端拒绝，绝不续活新租约。
+    // ------------------------------------------------------------------
+    let leaseToken = null;      // 我持有的租约凭证（不下发到快照，仅持有者知晓）
+    let leaseHbTimer = null;    // 心跳定时器
+    let iHold = false;          // 当前快照下我是否为租约持有者
+    let leaseView = null;       // { expiresAt, offset }：本地每秒刷新剩余有效期用
+
+    // 控制端显示名（同一标签页刷新后保持不变，用于租约持有者展示）
+    let myName = sessionStorage.getItem('cueControlName');
+    if (!myName) {
+      myName = '控制台-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+      sessionStorage.setItem('cueControlName', myName);
+    }
+
+    function stopLeaseHeartbeat() {
+      clearInterval(leaseHbTimer);
+      leaseHbTimer = null;
+    }
+
+    function startLeaseHeartbeat(ttlMs) {
+      stopLeaseHeartbeat();
+      leaseHbTimer = setInterval(() => {
+        if (leaseToken) client.send({ type: 'lease-heartbeat', token: leaseToken });
+      }, Math.max(1000, Math.floor((ttlMs || 10000) / 3)));
+    }
+
+    // 本地每秒刷新租约剩余有效期（以服务端时间偏移计算，与口令倒计时一致）
+    setInterval(() => {
+      const el = document.getElementById('leaseLeft');
+      if (!el || !leaseView) return;
+      const remain = Math.max(0, leaseView.expiresAt - (Date.now() + leaseView.offset));
+      el.textContent = remain > 0 ? `剩余 ${Math.ceil(remain / 1000)} 秒` : '已过期，可申请接管';
+    }, 500);
+
+    // 租约面板：无人持有 → 可申请；我持有 → 可释放；他人持有 → 可申请/到期接管
+    function renderLeasePanel(state) {
+      const lease = state.lease;
+      const ttlSec = Math.round((state.leaseTtlMs || 10000) / 1000);
+      const mode = !lease ? 'none' : iHold ? 'mine' : 'other-' + lease.holderId;
+      if (leasePanel.dataset.mode !== mode) {
+        leasePanel.dataset.mode = mode;
+        if (mode === 'none') {
+          leasePanel.innerHTML =
+            `<div class="row"><span class="narrow muted">当前无人持有指挥权（我是 ${CueClient.escapeHtml(myName)}）</span>` +
+            `<button class="narrow" id="leaseAcq">✋ 申请指挥权</button></div>` +
+            `<p class="muted">租约时长 ${ttlSec} 秒，由心跳自动续期；同一时刻仅持有者可执行开始 / 推进 / 替岗 / 撤回 / 暂停 / 恢复 / 重置。</p>`;
+          document.getElementById('leaseAcq').onclick = () => client.send({ type: 'lease-acquire' });
+        } else if (mode === 'mine') {
+          leasePanel.innerHTML =
+            `<div class="row"><span class="narrow lease-mine">✔ 我持有指挥权（${CueClient.escapeHtml(myName)}）</span>` +
+            `<span class="narrow" id="leaseLeft"></span>` +
+            `<button class="danger narrow" id="leaseRel">释放指挥权</button></div>` +
+            `<p class="muted">心跳自动续期（租约时长 ${ttlSec} 秒）；主动释放、断线或心跳超时后，其他控制端可申请接管。</p>`;
+          document.getElementById('leaseRel').onclick = () => client.send({ type: 'lease-release' });
+        } else {
+          leasePanel.innerHTML =
+            `<div class="row"><span class="narrow">指挥权由「${CueClient.escapeHtml(lease.holderName)}」持有</span>` +
+            `<span class="narrow" id="leaseLeft"></span>` +
+            `<button class="narrow" id="leaseTake">✋ 申请 / 到期接管</button></div>` +
+            `<p class="muted">租约未过期时不可抢占（服务端拒绝）；待其释放或过期后点击即可接管。非持有者的全部控制操作已被禁用。</p>`;
+          document.getElementById('leaseTake').onclick = () => client.send({ type: 'lease-acquire' });
+        }
+      }
+      leaseView = lease ? { expiresAt: lease.expiresAt, offset: state.serverNow - Date.now() } : null;
+    }
 
     function showToast(msg) {
       toast.textContent = msg;
@@ -139,8 +216,8 @@
       const active = state.phase === 'active';
       const cue = state.currentCue;
       const subs = state.substitutions || {};
-      // 口令推进、暂停、目标已确认或已被替岗时，自动收起选择面板
-      if (substitutingFor && (!active || state.paused || !cue || !cue.targets.includes(substitutingFor) ||
+      // 口令推进、暂停、失去指挥权、目标已确认或已被替岗时，自动收起选择面板
+      if (substitutingFor && (!active || state.paused || !iHold || !cue || !cue.targets.includes(substitutingFor) ||
           subs[substitutingFor] || state.confirmations[substitutingFor])) {
         substitutingFor = null;
       }
@@ -257,10 +334,20 @@
       const paused = active && state.paused;
       const cue = state.currentCue;
 
-      // 按钮可用性（暂停期间禁止推进）
-      btnStart.disabled = active || state.sequence.length === 0 || state.phase === 'done';
-      btnAdvance.disabled = !active || paused;
-      btnReset.disabled = state.phase === 'idle' && state.sequence.length === 0;
+      // 指挥权租约：凭证与快照持有者一致才算我持有；租约易主/释放后旧凭证立即作废
+      const myId = CueClient.getClientId();
+      if (leaseToken && (!state.lease || state.lease.holderId !== myId)) {
+        leaseToken = null;
+        stopLeaseHeartbeat();
+      }
+      iHold = !!(leaseToken && state.lease && state.lease.holderId === myId);
+      renderLeasePanel(state);
+      opLeaseHint.style.display = iHold ? 'none' : 'block';
+
+      // 按钮可用性（暂停期间禁止推进；未持有指挥权租约时全部禁用，服务端同样拒绝）
+      btnStart.disabled = !iHold || active || state.sequence.length === 0 || state.phase === 'done';
+      btnAdvance.disabled = !iHold || !active || paused;
+      btnReset.disabled = !iHold || (state.phase === 'idle' && state.sequence.length === 0);
 
       // 顶部横幅（暂停状态优先展示）
       banner.className = 'status-banner';
@@ -291,7 +378,7 @@
         cueArea.innerHTML = '<p class="muted" style="text-align:center;padding:24px">等待开始（请先在导演端创建序列）</p>';
       }
 
-      // 目标岗位（含临时替岗：原岗位划线，替补以有效目标参与确认；暂停期间不提供替岗入口）
+      // 目标岗位（含临时替岗：原岗位划线，替补以有效目标参与确认；暂停期间或非持有者不提供替岗入口）
       if (active && cue) {
         const subs = state.substitutions || {};
         targetsEl.innerHTML = cue.targets.map((t) => {
@@ -301,7 +388,7 @@
               targetChip(state, sub.substitute, { isSub: true });
           }
           let html = targetChip(state, t, {});
-          if (!paused && !state.confirmations[t]) {
+          if (!paused && !state.confirmations[t] && iHold) {
             html += `<button class="mini" data-subfrom="${CueClient.escapeHtml(t)}">⇄ 替岗</button>`;
           }
           return html;
@@ -312,6 +399,12 @@
       renderSubPanel(state);
       renderPausePanel(state);
       renderRecallPanel(state);
+
+      // 非持有者禁用各面板提交按钮（面板 DOM 按模式缓存，这里就地切换禁用态）
+      for (const id of ['pauseGo', 'resumeGo', 'recallGo', 'subGo']) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !iHold;
+      }
 
       // 本条口令的只读旧轮次历史（撤回封存、完成封存）
       if (active && cue && state.cueHistory && state.cueHistory[cue.id]) {
@@ -367,11 +460,23 @@
 
     const client = CueClient.connect({
       role: 'control',
+      getName: () => myName,
       onState: render,
       onError: showToast,
+      onLeaseGranted(data) {
+        // 租约凭证仅此通道下发：保存并启动心跳续期
+        leaseToken = data.token;
+        startLeaseHeartbeat(data.ttlMs);
+        showToast('已获得指挥权租约，心跳自动续期中');
+      },
       onConnChange(on) {
         connEl.textContent = on ? '已连接' : '连接断开，重连中…';
         connEl.classList.toggle('on', on);
+        if (!on) {
+          // 断线即失去租约（服务端自动释放），旧凭证作废、停止心跳
+          leaseToken = null;
+          stopLeaseHeartbeat();
+        }
       },
     });
   </script>

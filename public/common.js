@@ -16,8 +16,10 @@ const CueClient = (() => {
    * @param {object} opts
    * @param {string} opts.role - 'director' | 'control' | 'position'
    * @param {() => (string|null)} [opts.getPosition] - 岗位端返回岗位名
+   * @param {() => (string|null)} [opts.getName] - 控制端返回显示名（租约持有者展示用）
    * @param {(state: object) => void} opts.onState
    * @param {(message: string) => void} [opts.onError]
+   * @param {(data: object) => void} [opts.onLeaseGranted] - 获得指挥权租约（含 token，心跳须携带）
    * @param {(connected: boolean) => void} [opts.onConnChange]
    */
   function connect(opts) {
@@ -29,6 +31,7 @@ const CueClient = (() => {
       if (opts.role === 'position' && opts.getPosition) {
         payload.position = opts.getPosition();
       }
+      if (opts.getName) payload.name = opts.getName();
       send(payload);
     }
 
@@ -45,6 +48,7 @@ const CueClient = (() => {
         try { data = JSON.parse(ev.data); } catch { return; }
         if (data.type === 'state') opts.onState(data.state);
         else if (data.type === 'error' && opts.onError) opts.onError(data.message);
+        else if (data.type === 'lease-granted' && opts.onLeaseGranted) opts.onLeaseGranted(data);
       };
       ws.onclose = () => {
         if (opts.onConnChange) opts.onConnChange(false);
@@ -84,6 +88,10 @@ const CueClient = (() => {
     'stale-confirm-ignored': '旧轮次确认被拒',
     'stale-timeout-ignored': '旧轮次定时器被拒',
     'stale-substitute-ignored': '旧轮次替岗被拒',
+    'lease-acquired': '指挥权租约授予',
+    'lease-released': '指挥权租约释放',
+    'lease-acquire-denied': '指挥权申请被拒',
+    'stale-heartbeat-ignored': '迟到心跳被拒',
     'confirm': '岗位确认',
     'confirm-late': '迟到确认',
     'confirm-duplicate': '重复确认',
@@ -102,7 +110,8 @@ const CueClient = (() => {
         .join(' ');
       const cls = ['cue-timeout', 'confirm-duplicate', 'confirm-late',
         'stale-confirm-ignored', 'stale-timeout-ignored', 'stale-substitute-ignored',
-        'cue-recalled', 'cue-paused', 'paused-confirm-rejected'].includes(e.event)
+        'cue-recalled', 'cue-paused', 'paused-confirm-rejected',
+        'lease-acquire-denied', 'stale-heartbeat-ignored'].includes(e.event)
         ? 'log-warn' : '';
       return `<div class="log-row ${cls}"><span class="log-ts">${fmtTime(e.ts)}</span>` +
         `<span class="log-event">${label}</span><span class="log-detail">${escapeHtml(detail)}</span></div>`;
